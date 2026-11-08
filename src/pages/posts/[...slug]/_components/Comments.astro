@@ -1,0 +1,54 @@
+<section id="comments" class="mt-8" data-pagefind-ignore>
+  <div class="giscus"></div>
+</section>
+
+<script is:inline data-astro-rerun>
+  (() => {
+    const container = document.querySelector("#comments .giscus");
+    if (!container) return;
+
+    const currentTheme = () =>
+      document.documentElement.getAttribute("data-theme") === "dark"
+        ? "dark"
+        : "light";
+
+    const attrs = {
+      repo: "faaany/faaany.github.io",
+      "repo-id": "R_kgDOUre6hw",
+      category: "Announcements",
+      "category-id": "DIC_kwDOUre6h84DKqRm",
+      mapping: "pathname",
+      strict: "0",
+      "reactions-enabled": "1",
+      "emit-metadata": "0",
+      "input-position": "bottom",
+      theme: currentTheme(),
+      lang: "en",
+      loading: "lazy",
+    };
+
+    const script = document.createElement("script");
+    script.src = "https://giscus.app/client.js";
+    for (const [key, value] of Object.entries(attrs)) {
+      script.setAttribute(`data-${key}`, value);
+    }
+    script.crossOrigin = "anonymous";
+    script.async = true;
+    container.appendChild(script);
+
+    // Keep giscus in sync with the site's theme toggle.
+    window.__giscusThemeObserver?.disconnect();
+    window.__giscusThemeObserver = new MutationObserver(() => {
+      document
+        .querySelector("iframe.giscus-frame")
+        ?.contentWindow?.postMessage(
+          { giscus: { setConfig: { theme: currentTheme() } } },
+          "https://giscus.app"
+        );
+    });
+    window.__giscusThemeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-theme"],
+    });
+  })();
+</script>
