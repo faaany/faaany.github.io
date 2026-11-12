@@ -199,19 +199,18 @@ scheduler firmware) could not even stop it. That means the queue was really stuc
 Nothing was logged *during* the hang itself, probably because these long-running ("lr") queues have 
 no timeout.
 
-Then I checked the Kubernetes CI node where a colleague had hit the same timeout, and the timestamps
-lined up exactly:
+Then I checked a second CI machine that had hit the same timeout, and the timestamps lined up
+exactly:
 
 | Time (UTC) | Event |
 |---|---|
 | 07:30:52 | pytest-timeout fires in the CI job |
 | 07:30:57 | vLLM force-kills the two workers |
-| 07:31:02 | node kernel: `Schedule disable failed to respond` + device coredump |
+| 07:31:02 | kernel: `Schedule disable failed to respond` + device coredump |
 
-Same signature on a different machine, with a different kernel (6.17 vs 7.0) and a different GuC
-firmware (70.45 vs 70.58). So this is not a single badly configured machine, and not simply an old
-kernel. The investigation now belongs to the GPU driver team, with the stacks, the offset comparison
-and the device coredump as evidence.
+The same signature on a second machine ruled out a single badly configured host. At this point the
+evidence (the stacks, the offset comparison and the device coredump) pointed below the user-space
+libraries, which is where this write-up stops.
 
 > **Prefer `journalctl -k` over `dmesg`:** on a busy Kubernetes node, AppArmor audit messages from
 > container probes (one every 10 s) quickly push older driver messages out of the `dmesg` ring buffer.
@@ -241,8 +240,7 @@ likely luck. Small sample sizes are misleading for intermittent bugs.
 ## Appendix: a watchdog that dumps stacks automatically
 
 If you don't know when the hang will happen (for example in CI), run a background watchdog that dumps
-any worker that lives too long. A normal TP=2 startup takes well under a minute, and pytest-timeout
-kills a hung test after 120 s, so 90 s leaves enough time to capture the stacks:
+any worker that lives too long.
 
 ```bash
 (while sleep 15; do

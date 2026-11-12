@@ -32,3 +32,6 @@ public/pagefind
 # docker compose
 compose.override.yaml
 .npmrc
+
+# private work journals
+src/content/posts/_worklogs/

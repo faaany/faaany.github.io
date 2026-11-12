@@ -1,0 +1,254 @@
+---
+title: A System Debugging Guide to the GPU Stack under vLLM on Intel GPUs
+pubDatetime: 2026-11-12T13:43:43.000+08:00
+description: A layer-by-layer guide to debugging hangs and crashes in vLLM on Intel GPUs, from Python processes down to the xe driver, GuC firmware and GPU engines, with the knobs, logs, tools and version checks for each layer.
+tags:
+  - debugging
+  - gpu
+  - vllm
+draft: false
+---
+
+import { Image } from "astro:assets";
+import gpuStack from "@/assets/images/gpu-stack.jpg";
+
+I used to think that when a GPU job hangs the hardware is to blame. After chasing many hang issues, I see it differently: the application only shows a symptom — it is stuck, or the device is gone — but the cause can sit in any of the nine layers between applications and the GPU engines. **System debugging means following that symptom down, layer by layer, until you find the layer where things went wrong.**
+
+This post is my field guide to that stack, with vLLM inference on Intel Arc Pro B70 (BMG) as the running example. For each layer it lists what the layer does, the knobs it exposes, where its evidence lives, how to inspect it and how to check its version. It is also my own cheat sheet for next time, and I will keep extending it as I run into new problems.
+
+## How to think about the stack
+
+From a bird's-eye view the stack is like a cake: each layer is built on the one below. The deeper the problem, the harder it is to see from the top.
+
+For hangs, one useful mental model is: every call travels down through all the layers, and its completion has to travel all the way back up. **A hang is a completion that never came back.** Debugging means finding the layer where it got lost.
+
+<Image src={gpuStack} alt="GPU software stack under vLLM" style="width: 70%; height: auto;" />
+
+The stack is not a strict chain. PyTorch reaches SYCL through the four libraries in the row under it: its own XPU ops call SYCL directly, matmul and conv go through oneDNN, collectives through oneCCL, and vLLM's custom ops through vllm-xpu-kernels. oneCCL also bypasses SYCL and calls Level Zero and the linux kernel directly to exchange IPC handles. The coloured long-dash line marks the user/kernel boundary; the dotted line marks kernel/firmware. Everything above the long-dashed line under Level Zero comes with the container image; everything below it comes with the host.
+
+## The layers, one by one
+
+Every layer section answers the same seven questions, so you can jump straight to the layer you suspect:
+
+1. **What it does** — one or two sentences.
+2. **Knobs** — environment variables and settings, each tagged *(used)* or *(not tried yet)*.
+3. **Evidence** — where its logs go and what the key lines look like.
+4. **How to inspect** — the tool and what to look at.
+5. **Version** — how to find it, for bug reports.
+6. **Typical symptoms** — what you see from above when this layer is at fault.
+7. **Related write-ups** — links to case write-ups, added only once one exists.
+
+### 1. vLLM processes
+
+**What it does.** One vLLM instance is several processes: the front-end (API server or `LLM`), an EngineCore process, and several worker process per GPU rank. The first question of any hang or crash is which of these pids is stuck, or which one died first.
+
+**Knobs.**
+
+- `VLLM_LOGGING_LEVEL=DEBUG` — more vLLM logs
+- `VLLM_ENABLE_V1_MULTIPROCESSING=0` — run EngineCore in the front-end process, simpler to inspect
+
+**Evidence.** Log lines are prefixed with the process: `(EngineCore pid=…)`, `(Worker_TP1 pid=…)`. Process titles are `VLLM::EngineCore` and `VLLM::Worker…`.
+
+**How to inspect.** `ps -ef | grep VLLM`, then `py-spy dump --native --pid <pid>` on each worker. This is for a hang: py-spy attaches to a live process. After a crash the process is gone, so read its traceback in the log instead, and keep `PYTHONFAULTHANDLER=1` set so that a native crash (segfault, abort) still prints the Python stack. To match process titles exactly, anchor the pattern: `pgrep -f "^VLLM::Worker"`.
+
+To find which GPU op a hang or crash comes from, add `torch.xpu.synchronize()` after suspect ops in vLLM's code (model forward, attention, MoE); see [2. PyTorch](#m8qzah73rkm.3320).
+
+**Version.** `python -c "import vllm; print(vllm.__version__)"`
+
+**Typical symptoms.** A worker crashes with a traceback, or the server hangs with "No available shared memory broadcast block found in 60 seconds", which means EngineCore is waiting on a worker that stopped responding.
+
+### 2. PyTorch (xccl backend)
+
+**What it does.** `torch.xpu` runs ordinary tensor ops through SYCL directly. `torch.distributed` with `backend="xccl"` (ProcessGroupXCCL) hands collectives to oneCCL. So a hang in a collective goes through oneCCL, while a hang in `torch.xpu.synchronize()` does not.
+
+**Knobs.**
+
+- `TORCH_DISTRIBUTED_DEBUG=DETAIL` — extra c10d checks and logs
+- `PYTHONFAULTHANDLER=1` — set it before starting the process; on its own it does nothing. When the process gets a fatal signal (a crash, or you send `kill -ABRT <pid>` to a hung process), it prints every thread's Python stack before dying.&#32;
+
+**Evidence.** Python tracebacks; with `PYTHONFAULTHANDLER=1`, a stack dump on SIGABRT.
+
+**How to inspect.** `py-spy dump --native` shows the Python frame (`dist.all_reduce`, `torch.xpu.synchronize`) and the native frames below it, which tell you which library to look at next. GPU work is asynchronous, so an error or a hang often surfaces later than the op that caused it. To pin it down, insert torch.xpu.synchronize() right after a suspect op: if the process now stops there, that op or one before it never completed.
+
+**Version.** `python -c "import torch; print(torch.__version__, torch.version.xpu)"`
+
+**Typical symptoms.** The Python stack ends in a collective or in `synchronize()`. On its own that is never the root cause: the work is waiting on something below.
+
+### 3. oneCCL (libccl)
+
+**What it does.** oneCCL implements collectives (all\_reduce, all\_gather, …) across GPUs. The communicator is created lazily on the first collective (`coll_init`): it sets up copy-engine queues, allocates scratch buffers and exchanges IPC handles with the other ranks, so that each GPU can read its peers' memory.
+
+**Knobs.**
+
+- `CCL_LOG_LEVEL=info|debug|trace` — `info` is enough to see topology and IPC mode
+- `CCL_ZE_IPC_EXCHANGE=pidfd|drmfd|sockets` — how IPC handles are passed between processes
+- `CCL_ATL_TRANSPORT=ofi|mpi` — host-side transport for the handshake
+
+**Evidence.** Lines prefixed `|CCL_WARN|` or `|CCL_INFO|` on each rank's stdout:
+
+- `topology recognition shows PCIe connection between devices` — no direct GPU-to-GPU link
+- `pidfd is not supported, fallbacks to drmfd exchange mode` — the container lacks ptrace-like privilege
+- `PCI device [0:NN:0:0]` — which physical card this rank uses (NN is the bus number in decimal)
+
+**How to inspect.** The library has no debug symbols, so locate the exact call by function plus offset. The example below uses coll\_init, the function that builds the communicator on the first collective; replace it with whatever function your stack shows:
+
+```bash
+gdb -p <pid> -batch -ex "bt 15" -ex "frame function coll_init" \
+    -ex "info symbol \$pc" -ex "x/i \$pc-5"
+gdb -batch -ex "disassemble 'coll_init(ccl_comm*, ccl_stream*)'" <path>/libccl.so.1 | grep call
+```
+
+The instruction just before `$pc` is the call that has not returned.
+
+**Version.** Printed at init with `CCL_LOG_LEVEL=info`. In the vLLM XPU image, `libccl.so.1` is not installed separately: it comes as a pip dependency of the PyTorch XPU wheel and lives in /opt/venv/lib. Check the package and version with pip list | grep -i ccl.
+
+**Typical symptoms.**
+
+- A hang in the first collective of a process means communicator init, not the collective itself.
+
+### 4. SYCL runtime (libsycl)
+
+**What it does.** The DPC++ SYCL runtime gives C++ code queues, events, kernels and memory operations (`memcpy`, `memset`). Every submission returns an event; `event.wait()` blocks until the layers below report completion.
+
+**Knobs.**
+
+- `SYCL_UR_USE_LEVEL_ZERO_V2=0|1` — choose the v1 or v2 Level Zero adapter in UR *(used)*
+- `SYCL_UR_TRACE=2` — print every UR call the runtime makes&#32;
+- `ONEAPI_DEVICE_SELECTOR=level_zero:0,1` — which devices SYCL sees
+
+**Evidence.** Silent by default; exceptions surface as `sycl::exception` in the caller.
+
+**How to inspect.** In gdb, frames like `sycl::_V1::detail::event_impl::wait` mean someone is waiting on an event; look below them for the UR adapter. `sycl-ls` lists the devices SYCL can see.
+
+```bash
+# backtrace of every thread; look for event_impl::wait and the frames below it
+gdb -p <pid> -batch -ex "thread apply all bt 20"
+```
+
+**Version.** `pip list | grep -i sycl` (the runtime ships as a pip package with torch). `sycl-ls --verbose` also works if the oneAPI toolkit is installed; check with `which sycl-ls`.
+
+**Typical symptoms.** A thread blocked in `event_impl::wait` with the GPU idle: the work was submitted, but its completion never came back.
+
+### 5. Unified Runtime (libur\_\*)
+
+**What it does.** UR is the portability layer under SYCL: `libur_loader` dispatches to a backend adapter, here the Level Zero adapter (`libur_adapter_level_zero` for v1, `libur_adapter_level_zero_v2` for v2), which turns SYCL operations into Level Zero command lists and events.
+
+**Knobs.**
+
+- `SYCL_UR_USE_LEVEL_ZERO_V2=0|1` — v1 or v2 adapter&#32;
+- `UR_L0_USE_COPY_ENGINE=0` — keep copies off the copy engines
+- `UR_LOG_LEVEL_ZERO="level:debug;flush:debug;output:stderr"` — adapter debug log
+
+**Evidence.** Silent by default; the adapter log above, if enabled.
+
+**How to inspect.** The gdb frame name tells you the adapter: `ur::level_zero::urEventWait` inside `libur_adapter_level_zero_v2.so.0` means v2.
+
+**Version.** UR ships in the same pip package as the SYCL runtime, so `pip list | grep -i sycl` gives its version. `ls /opt/venv/lib/libur_*` lists the loader and the adapters; `grep libur_ /proc/<pid>/maps` shows which adapter (v1 or v2) a process actually loaded.
+
+**Typical symptoms.** Switching adapters changes the symptom: if v1 and v2 hang the same way, the adapter is unlikely to be the cause.
+
+### 6. Level Zero (user-mode driver)
+
+**What it does.** Level Zero is Intel's low-level GPU API, in two parts: the loader (`libze_loader.so.1`) and the actual driver (`libze_intel_gpu.so.1`, built from compute-runtime, also called NEO). This is the user-mode driver (UMD): it builds command buffers and talks to the kernel driver through ioctls.
+
+**Knobs.**
+
+- `ZE_AFFINITY_MASK=0,1` — which GPUs a process sees *(used)*.&#32;
+- `ZE_ENABLE_TRACING_LAYER=1` with a tracer such as unitrace — log every Level Zero call
+- `NEOReadDebugKeys=1` plus compute-runtime debug keys such as `PrintDebugMessages=1`&#32;
+
+**Evidence.** Nothing by default.
+
+**How to inspect.** In gdb the top frames show as `?? () from libze_intel_gpu.so.1`. That still tells you the thread is inside the driver, not in oneCCL or SYCL.
+
+**Version.** `dpkg -l | grep -Ei "libze|intel-opencl|level-zero"`, or `ls -l /lib/x86_64-linux-gnu/libze_intel_gpu.so.1*` (the file name carries the build number, e.g. `1.17.39395`).
+
+**Typical symptoms.** A thread waiting inside `libze_intel_gpu` with the GPU idle: the UMD is waiting for a completion that the kernel or the GPU never delivered. Calls returning ZE\_RESULT\_ERROR\_DEVICE\_LOST mean the driver has marked the device or context unusable; the cause is often a GPU op (kernel) that faulted, e.g. an out-of-bounds access, and the kernel log shows the fault.
+
+### 7. xe kernel driver (KMD)
+
+**What it does.** `xe` is the Linux kernel driver for Intel Xe GPUs. It owns GPU memory and exec queues, passes submissions to the GuC firmware, and handles resets when something goes wrong.
+
+**Knobs.** Module parameters (`modinfo -p xe`) and kernel boot parameters. Mostly not something to change while debugging; record them when comparing machines.
+
+**Evidence.** Kernel log lines tagged with the card's PCI address, e.g. `xe 0000:94:00.0: [drm] GT0: ...`. Read them with `journalctl -k`: `dmesg` is a ring buffer that can be overwritten, and `dmesg -T` timestamps drift.
+
+**How to inspect.**
+
+- `sudo journalctl -k --since "-1 hour" | grep "xe 0000:"` *(used)*
+- debugfs: `/sys/kernel/debug/dri/<BDF>/gt0/` (`hw_engines`, `uc/guc_info`, …)&#32;
+- tracepoints: `/sys/kernel/tracing/events/xe/` show whether a job was submitted, scheduled and completed *(not tried yet)*
+
+**Version.** `uname -r`; `modinfo xe | grep -i version`.
+
+**Typical symptoms.**
+
+- `Engine reset: engine_class=bcs|ccs` right after killing a busy process: normal recovery, not a bug on its own.
+- `Schedule disable failed to respond`, then a devcoredump and `trying reset from xe_guc_exec_queue_lr_cleanup`: the GuC could not stop a queue. This is serious.
+- During a hang on a long-running queue the kernel logs nothing; messages appear only when the process is killed.
+
+### 8. GuC firmware
+
+**What it does.** The GuC is a microcontroller on the GPU running closed-source firmware. It decides which context runs on which engine, and when. The kernel driver talks to it over a message channel (CT): "enable scheduling for this queue", "disable it", "reset this engine".
+
+**Knobs.** None in practice; the firmware file is loaded by the kernel driver at boot.
+
+**Evidence.** Kernel log lines that mention the GuC or a `guc_id`; debugfs `uc/guc_info` and the GuC log in debugfs *(log not tried yet)*.
+
+**How to inspect.** `sudo cat /sys/kernel/debug/dri/<BDF>/gt0/uc/guc_info` shows the firmware version the driver *found* and the one it *wanted*.
+
+**Version.** The `found` / `wanted` lines in `guc_info`.
+
+**Typical symptoms.**
+
+- Compute work runs in long-running queues, which have no timeout. If the GuC never schedules a job, nothing fires and nothing is logged.
+- `Schedule disable failed to respond` means the driver asked the GuC to stop a queue and got no answer.
+
+### 9. GPU engines
+
+**What it does.** Engines are the hardware units that execute work: `ccs` (compute command streamer) runs kernels, `bcs` (blitter, the copy engine) moves memory. A copy and a kernel from the same process can land on different engines.
+
+**Knobs.** Indirect only: `UR_L0_USE_COPY_ENGINE` and `CCL_ZE_COPY_ENGINE` decide whether copies go to `bcs` at all.
+
+**Evidence.** Engine resets in the kernel log name the class (`engine_class=bcs`); utilization in `xpu-smi`.
+
+**How to inspect.**
+
+- `xpu-smi stats -d <id>` — utilization; near zero during a hang means the GPU is not busy, it is waiting *(used)*
+- `sudo cat /sys/kernel/debug/dri/<BDF>/gt0/hw_engines` — per-engine registers such as ring head/tail and INSTDONE; capture during the hang, before any kill
+
+**Version.** Hardware; the firmware version is in `guc_info`.
+
+**Typical symptoms.** A busy GPU with no progress points at a kernel; an idle GPU with a pending event points at submission or scheduling.
+
+## Cheatsheet
+
+```bash
+# Python stack, with native frames
+py-spy dump --native --pid <pid>
+
+# Native stacks of all threads
+gdb -p <pid> -batch -ex "thread apply all bt 20"
+
+# Exact call a function is stuck in (no debug symbols needed)
+gdb -p <pid> -batch -ex "frame function <func>" -ex "info symbol \$pc" -ex "x/i \$pc-5"
+gdb -batch -ex "disassemble '<func>(<args>)'" <path>/<lib>.so | grep call
+
+# Kernel log
+sudo journalctl -k --since "-1 hour" | grep -E "xe 0000:"
+sudo dmesg -T
+
+# GuC version and engine state
+sudo cat /sys/kernel/debug/dri/<BDF>/gt0/uc/guc_info
+sudo cat /sys/kernel/debug/dri/<BDF>/gt0/hw_engines
+
+
+# GPU utilization
+xpu-smi stats -d <id>
+
+# CCL Logs
+CCL_LOG_LEVEL=info <your command>
+
+# Load driver to linux kernel
+sudo modprobe xe
+```
